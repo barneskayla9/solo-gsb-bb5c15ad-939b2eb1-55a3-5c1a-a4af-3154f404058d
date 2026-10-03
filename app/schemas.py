@@ -172,3 +172,48 @@ class LicenseTransferConfirmRequest(LicenseTransferRequest):
     """
 
     expected_revision: int = Field(ge=0)
+
+
+class EmergencyOccupationRequest(BaseModel):
+    """Rehearse an emergency frequency occupation (burst communication).
+
+    Names the still-pending application that needs the spectrum urgently and
+    an operator reason.  The read-only preview returns the current revision,
+    the effective ordinary licenses the emergency would forcibly suspend and
+    the active restriction windows the application hits; it never mutates
+    state.  The confirm request adds the mandatory ``expected_revision`` (see
+    :class:`EmergencyOccupationConfirmRequest`).
+    """
+
+    application_id: int = Field(ge=1)
+    reason: str = Field(default="", max_length=2000)
+
+
+class EmergencyOccupationConfirmRequest(EmergencyOccupationRequest):
+    """Commit a rehearsed emergency occupation under revision arbitration.
+
+    The application must still be pending, must hit no active restriction
+    window and must not interfere with another effective emergency license;
+    otherwise the whole request is rejected and no revision is consumed.  On
+    success every interfering ordinary license is first forcibly suspended
+    (consecutive revisions, no waitlist re-adjudication), a queued emergency
+    application leaves the waitlist, and the emergency approval consumes the
+    next consecutive revision.
+    """
+
+    expected_revision: int = Field(ge=0)
+
+
+class EmergencyReleaseRequest(BaseModel):
+    """Lift an active emergency occupation by its application id.
+
+    Carries the expected revision (the decision basis) and an optional
+    operator reason.  The emergency license is revoked first; the licenses
+    still forcibly suspended by this occupation are then re-adjudicated in
+    their suspension order under the current guard band and windows, and the
+    waitlist is drained by the normal FIFO rules - all in one atomic
+    transaction.  A stale revision or a repeated release changes nothing.
+    """
+
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)

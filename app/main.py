@@ -26,6 +26,13 @@ GET    /api/restriction-windows          list active (+ released) windows
 GET    /api/restriction-windows/{id}     one window (active or released)
 POST   /api/license-transfers/preview    rehearse an effective->pending handover
 POST   /api/license-transfers            confirm a handover (expected revision)
+POST   /api/emergency-occupations/preview
+                                         rehearse a burst-communication occupation
+POST   /api/emergency-occupations        confirm an occupation (expected revision)
+POST   /api/emergency-occupations/{id}/release
+                                         lift an occupation (expected revision)
+GET    /api/emergency-occupations        list occupations (active + released)
+GET    /api/emergency-occupations/{id}   one occupation (active or released)
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/revision/compare             compare two as-of revision snapshots
@@ -129,6 +136,38 @@ are left untouched.  The handover appends one immutable
 ``license_transfer_events`` row linking its two revisions, so revision
 snapshots and comparisons restore every revision exactly; existing
 revocation and approval semantics (and startup) are unchanged.
+
+Burst-communication emergency occupations
+-----------------------------------------
+When burst traffic must take the spectrum urgently, an operator rehearses an
+emergency occupation with the pending application id and a reason: the
+read-only preview returns the current revision, the effective *ordinary*
+licenses the emergency would forcibly suspend (its interference set under
+the live guard band, tagged ``is_emergency`` when another emergency license
+is among them) and the active restriction windows the application hits; it
+never mutates state.  The confirmation carries the expected revision and
+runs inside the same singleton revision arbitration: the application must
+still be pending, must hit no window, and must not interfere with another
+effective emergency license, otherwise the whole request is rejected and no
+revision is consumed.  On success the interfering ordinary licenses are
+first recorded as forced suspensions of this occupation (one ordinary
+``suspension_events`` row plus one ``emergency_suspension_events`` marker
+each, application-id order, no waitlist re-adjudication), a queued
+emergency application leaves the waitlist, and it is then approved on the
+next consecutive revision with an ordinary ``ApprovalEvent``; the original
+approval records are never rewritten.  Forcibly suspended licenses can
+still be revoked ordinarily, but ordinary resume requests are refused while
+the occupation is in force.  An effective emergency license cannot be
+ordinarily suspended or revoked; the only way the occupation ends is the
+dedicated release (id + expected revision): the emergency license is
+revoked first, the licenses still suspended *by this occupation* are then
+re-adjudicated in their suspension order under the current band and windows
+(passers are restored one revision each; blocked licenses stay suspended
+with the reason returned), and finally the waitlist is drained by the
+existing FIFO rules - the whole release commits atomically.  Stale
+revisions and duplicate releases leave the state untouched.  Every step
+appends an immutable emergency marker on the same revision as the ordinary
+event, so revision snapshots and comparisons restore every stage.
 """
 from __future__ import annotations
 
@@ -150,6 +189,9 @@ from .errors import APIError, api_error_handler
 from .models import (
     Application,
     ApprovalEvent,
+    EmergencyOccupationEvent,
+    EmergencyResumptionEvent,
+    EmergencySuspensionEvent,
     GuardBandEvent,
     LicenseTransferEvent,
     ResumptionEvent,
@@ -165,6 +207,9 @@ from .schemas import (
     ApprovalRequest,
     AvailableRangesRequest,
     BatchApprovalRequest,
+    EmergencyOccupationConfirmRequest,
+    EmergencyOccupationRequest,
+    EmergencyReleaseRequest,
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
     LicenseTransferConfirmRequest,
@@ -212,6 +257,20 @@ E_SOURCE_NOT_EFFECTIVE = "source_not_effective"
 E_SUCCESSOR_NOT_PENDING = "successor_not_pending"
 # A handover named the same application as source and successor (HTTP 422).
 E_SAME_APPLICATION = "same_application"
+# An emergency occupation targets a non-pending / unknown application, or an
+# operation hits an emergency-related lifecycle mismatch (HTTP 409).
+E_EMERGENCY_NOT_PENDING = "emergency_application_not_pending"
+# The emergency application would interfere with another effective emergency
+# license (ordinary licenses are forcibly suspended instead) (HTTP 409).
+E_EMERGENCY_INTERFERENCE = "emergency_interference"
+# No active emergency occupation exists for the given application, or it has
+# already been released (HTTP 409).
+E_EMERGENCY_NOT_ACTIVE = "emergency_occupation_not_active"
+# An ordinary suspend/resume/revoke was attempted against an emergency state:
+# an effective emergency license cannot be paused/revoked ordinarily, and a
+# license forcibly suspended by an active occupation cannot be resumed
+# ordinarily (HTTP 409).
+E_EMERGENCY_STATE = "emergency_occupation_active"
 
 
 # --------------------------------------------------------------------------- #
@@ -609,14 +668,17 @@ def transfer_preview_body(
                 ),
             }
         )
-    elif source.status != "approved":
+    elif source.status != "approved" or emergency_occupation_for(
+        session, payload.source_application_id
+    ) is not None:
         blockers.append(
             {
                 "code": E_SOURCE_NOT_EFFECTIVE,
                 "field": "source_application_id",
                 "message": (
-                    f"source application {source.id} is {source.status}; only an "
-                    "approved, non-suspended, non-revoked license can be handed over"
+                    f"source application {source.id} is not an ordinary "
+                    "effective license (an active emergency license can only "
+                    "be handed over by releasing its emergency occupation)"
                 ),
                 "status": source.status,
             }
@@ -724,6 +786,270 @@ def transfer_preview_body(
 
 
 # --------------------------------------------------------------------------- #
+# Burst-communication emergency occupations
+# --------------------------------------------------------------------------- #
+def load_active_occupations(
+    session,
+) -> list[EmergencyOccupationEvent]:
+    """Emergency occupation rows not yet released, in approval-revision order.
+
+    An occupation is in force exactly while its ``released_revision`` is
+    NULL.  The emergency application it approved is an effective emergency
+    license over that span (until the release transaction revokes it).
+    """
+    return (
+        session.query(EmergencyOccupationEvent)
+        .filter(EmergencyOccupationEvent.released_revision.is_(None))
+        .order_by(EmergencyOccupationEvent.approval_revision)
+        .all()
+    )
+
+
+def active_emergency_application_ids(session) -> set[int]:
+    """Application ids of the currently effective emergency licenses."""
+    return {row.application_id for row in load_active_occupations(session)}
+
+
+def emergency_occupation_for(
+    session, application_id: int
+) -> EmergencyOccupationEvent | None:
+    """The not-yet-released occupation owned by ``application_id``, if any."""
+    return (
+        session.query(EmergencyOccupationEvent)
+        .filter(
+            EmergencyOccupationEvent.application_id == application_id,
+            EmergencyOccupationEvent.released_revision.is_(None),
+        )
+        .one_or_none()
+    )
+
+
+def emergency_occupation_for_suspended(
+    session, application_id: int
+) -> EmergencyOccupationEvent | None:
+    """The still-active occupation that forcibly suspended ``application_id``.
+
+    Looks up the most recent forced-suspension marker of the license whose
+    owning occupation is still active.  Returns ``None`` for ordinary
+    suspensions, restored forced suspensions and forced suspensions whose
+    occupation has already been lifted (a forced license that stayed
+    suspended at its release keeps its marker but the occupation is no
+    longer active).
+    """
+    marker = (
+        session.query(EmergencySuspensionEvent)
+        .filter(EmergencySuspensionEvent.application_id == application_id)
+        .order_by(EmergencySuspensionEvent.revision.desc())
+        .first()
+    )
+    if marker is None:
+        return None
+    occupation = (
+        session.query(EmergencyOccupationEvent)
+        .filter(
+            EmergencyOccupationEvent.application_id
+            == marker.emergency_application_id
+        )
+        .one_or_none()
+    )
+    if occupation is None or occupation.released_revision is not None:
+        return None
+    # The license may have been restored (by this release or a later flow);
+    # in that case it is no longer forcibly suspended by the occupation.
+    restored = (
+        session.query(EmergencyResumptionEvent)
+        .filter(
+            EmergencyResumptionEvent.emergency_application_id
+            == marker.emergency_application_id,
+            EmergencyResumptionEvent.application_id == application_id,
+            EmergencyResumptionEvent.revision > marker.revision,
+        )
+        .first()
+    )
+    return None if restored is not None else occupation
+
+
+def serialize_occupation(
+    occupation: EmergencyOccupationEvent,
+    *,
+    forced_suspensions: list[EmergencySuspensionEvent] | None = None,
+    emergency_revocation_revision: int | None = None,
+) -> dict[str, Any]:
+    """Public shape of one emergency occupation (active or released)."""
+    suspended = forced_suspensions or []
+    body = {
+        "application_id": occupation.application_id,
+        "emergency_application_id": occupation.application_id,
+        "status": "active" if occupation.released_revision is None else "released",
+        "reason": occupation.reason,
+        "suspension_start_revision": occupation.suspension_start_revision,
+        "approval_revision": occupation.approval_revision,
+        "revision": occupation.approval_revision,
+        "forced_suspension_application_ids": sorted(
+            m.application_id for m in suspended
+        ),
+        "forced_suspensions": [
+            {
+                "revision": marker.revision,
+                "application_id": marker.application_id,
+                "sequence": marker.sequence,
+                "reason": marker.reason,
+            }
+            for marker in sorted(suspended, key=lambda m: m.sequence)
+        ],
+        "revocation_revision": occupation.revocation_revision,
+        "released_revision": occupation.released_revision,
+    }
+    if emergency_revocation_revision is not None:
+        body["revocation_revision"] = emergency_revocation_revision
+    return body
+
+
+def emergency_preview_body(
+    session,
+    payload: EmergencyOccupationRequest,
+    *,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
+    """Shared read-only rehearsal for an emergency occupation.
+
+    Adjudicates the emergency application against the whole current
+    effective set under the live guard band: every conflicting *ordinary*
+    license would be forcibly suspended on confirmation, while a conflict
+    with another *emergency* license is a hard blocker (emergencies never
+    suspend each other).  Active restriction window hits are hard blockers
+    too.  Status problems are reported as non-fatal ``blockers`` (like the
+    handover preview); the confirm endpoint enforces them hard.  Nothing here
+    mutates state.
+    """
+    meta = session.get(RevisionMeta, 1)
+    current = meta.revision
+    guard_band = meta.guard_band
+
+    emergency = session.get(Application, payload.application_id)
+    blockers: list[dict[str, Any]] = []
+    if emergency is None:
+        blockers.append(
+            {
+                "code": E_NOT_FOUND,
+                "field": "application_id",
+                "message": (
+                    f"application {payload.application_id} does not exist"
+                ),
+            }
+        )
+    elif emergency.status != "pending":
+        blockers.append(
+            {
+                "code": E_EMERGENCY_NOT_PENDING,
+                "field": "application_id",
+                "message": (
+                    f"application {emergency.id} is {emergency.status}; only a "
+                    "pending application can be occupied urgently"
+                ),
+                "status": emergency.status,
+            }
+        )
+
+    active_occupations = load_active_occupations(session)
+    emergency_ids = {occ.application_id for occ in active_occupations}
+    effective = load_effective_licenses(session)
+    window_rows = load_active_windows(session)
+
+    conflicts: list = []
+    window_hits: list = []
+    if emergency is not None:
+        candidate = to_license(emergency)
+        conflicts = adjudication.evaluate(candidate, effective, guard_band)
+        window_hits = window_hits_for(candidate, window_rows)
+
+    # Ordinary conflicting licenses would be forcibly suspended; a conflict
+    # with another emergency license cannot be resolved that way.
+    forced_conflicts = [
+        c for c in conflicts if c.other.application_id not in emergency_ids
+    ]
+    emergency_conflicts = [
+        c for c in conflicts if c.other.application_id in emergency_ids
+    ]
+
+    if emergency_conflicts:
+        blockers.append(
+            {
+                "code": E_EMERGENCY_INTERFERENCE,
+                "field": "application_id",
+                "message": (
+                    f"emergency application {payload.application_id} would "
+                    f"interfere with {len(emergency_conflicts)} effective "
+                    "emergency license(s); emergencies cannot suspend each other"
+                ),
+            }
+        )
+    if window_hits:
+        blockers.append(
+            {
+                "code": E_RESTRICTION_WINDOW,
+                "field": "application_id",
+                "message": (
+                    f"emergency application {payload.application_id} hits "
+                    f"{len(window_hits)} active restriction window(s)"
+                ),
+            }
+        )
+
+    def _conflict_view(conflict: Conflict) -> dict[str, Any]:
+        body = serialize_conflict(conflict, guard_band)
+        body["is_emergency"] = conflict.other.application_id in emergency_ids
+        return body
+
+    forced_ids = sorted(c.other.application_id for c in forced_conflicts)
+    n_forced = len(forced_conflicts)
+    return {
+        "application_id": payload.application_id,
+        "reason": payload.reason,
+        "current_revision": current,
+        "expected_revision": expected_revision,
+        "guard_band": guard_band,
+        "ready": not blockers,
+        "blockers": blockers,
+        "emergency_application": (
+            serialize_application(emergency) if emergency is not None else None
+        ),
+        "active_emergency_application_ids": sorted(emergency_ids),
+        "would_force_suspend_application_ids": forced_ids,
+        "would_force_suspend": [
+            _conflict_view(c)
+            for c in sorted(
+                forced_conflicts, key=lambda c: c.other.application_id
+            )
+        ],
+        "emergency_conflicts": [
+            _conflict_view(c)
+            for c in sorted(
+                emergency_conflicts, key=lambda c: c.other.application_id
+            )
+        ],
+        # Whole effective set the emergency was adjudicated against.
+        "effective_application_ids": [lic.application_id for lic in effective],
+        "has_conflicts": bool(conflicts),
+        "conflicts": [_conflict_view(c) for c in conflicts],
+        "has_restriction_window_conflicts": bool(window_hits),
+        "restriction_window_conflicts": [
+            serialize_window_hit(h) for h in window_hits
+        ],
+        "active_restriction_window_ids": [row.id for row in window_rows],
+        "emergency_waitlist_position": (
+            _waitlist_position(session, payload.application_id)
+            if emergency is not None
+            else None
+        ),
+        # On a successful confirm the forced suspensions occupy n+1 .. n+k
+        # and the emergency approval occupies n+k+1 (same value when k == 0).
+        "planned_suspension_start_revision": current + 1,
+        "planned_approval_revision": current + 1 + n_forced,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Revision snapshots
 # --------------------------------------------------------------------------- #
 def guard_band_at(session, revision: int) -> float:
@@ -796,6 +1122,60 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(RestrictionWindowEvent.revision)
         .all()
     )
+    # Load every occupation row, even one whose approval revision is later
+    # than the queried revision: at a revision inside the forced-suspension
+    # sequence the marker revisions already exist (the whole occupation
+    # commits as one transaction), and the marker's link names the owner.
+    all_emergency_occupations = (
+        session.query(EmergencyOccupationEvent)
+        .order_by(EmergencyOccupationEvent.approval_revision)
+        .all()
+    )
+    emergency_occupations = [
+        occ
+        for occ in all_emergency_occupations
+        if occ.approval_revision <= revision
+        or occ.suspension_start_revision <= revision
+    ]
+    emergency_suspensions = (
+        session.query(EmergencySuspensionEvent)
+        .filter(EmergencySuspensionEvent.revision <= revision)
+        .order_by(EmergencySuspensionEvent.revision)
+        .all()
+    )
+    emergency_resumptions = (
+        session.query(EmergencyResumptionEvent)
+        .filter(EmergencyResumptionEvent.revision <= revision)
+        .order_by(EmergencyResumptionEvent.revision)
+        .all()
+    )
+
+    # Index the emergency markers so the lifecycle replay below can tell an
+    # ordinary outage suspension/resumption apart from an emergency one:
+    # at the same revision exactly one event exists, and the marker simply
+    # classifies it.
+    emergency_suspension_by_revision = {
+        ev.revision: ev for ev in emergency_suspensions
+    }
+    emergency_resumption_by_revision = {
+        ev.revision: ev for ev in emergency_resumptions
+    }
+    # Occupations active *as of the revision*: approved already, not (yet)
+    # released at or before it.  (Forced-suspension markers may exist one or
+    # more revisions before the approval revision, but the emergency license
+    # itself only becomes effective at the approval revision.)
+    active_occupation_map = {
+        occ.application_id: occ
+        for occ in all_emergency_occupations
+        if occ.approval_revision <= revision
+        and (occ.released_revision is None or occ.released_revision > revision)
+    }
+    # Occupation rows by their approval revision, including the in-flight
+    # one when a queried revision sits inside its forced-suspension
+    # sequence, so the marker classification below always finds its owner.
+    occupation_by_approval_revision = {
+        occ.approval_revision: occ for occ in all_emergency_occupations
+    }
 
     # Replay every lifecycle event up to the target revision in revision
     # order; the last event of each application decides its as-of state.
@@ -827,11 +1207,19 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
     approval_records: list[dict[str, Any]] = []
     effective_ids: list[int] = []
     suspended_ids: list[int] = []
+    # Subset of the suspended licenses forcibly paused by an emergency
+    # occupation that is still in force at the queried revision (such
+    # licenses cannot be resumed ordinarily until the occupation is lifted).
+    emergency_suspended_ids: list[int] = []
+    # Emergency applications effectively holding their occupation at the
+    # queried revision (approved, not yet revoked).
+    active_emergency_ids: list[int] = []
     for ev in approvals:
         app = session.get(Application, ev.application_id)
         status_as_of, marker = state.get(
             ev.application_id, ("approved", ev.revision)
         )
+        is_emergency = ev.application_id in active_occupation_map
         record = {
             "revision": ev.revision,
             "application_id": ev.application_id,
@@ -842,6 +1230,10 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "auto_approved": bool(ev.auto_approved),
             "release_revision": ev.release_revision,
             "created_at": iso(ev.created_at),
+            # True for the ordinary approval event of an emergency
+            # occupation that is in force at the queried revision; the
+            # emergency occupation records below carry the full lifecycle.
+            "emergency": is_emergency,
             # Status of this grant *as of the queried revision*.
             "status_as_of": status_as_of,
             "application": serialize_application(app) if app else None,
@@ -851,8 +1243,35 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         elif status_as_of == "suspended":
             record["suspended_at_revision"] = marker
             suspended_ids.append(ev.application_id)
+            forced_marker = emergency_suspension_by_revision.get(marker)
+            if forced_marker is not None:
+                # Forced by an emergency: either the occupation's emergency
+                # license is still in force at the queried revision, or the
+                # revision sits inside the forced-suspension sequence before
+                # the approval revision.  Once the occupation has been
+                # released at or before the revision, the surviving
+                # suspension is an ordinary one again.
+                owner = occupation_by_approval_revision.get(
+                    forced_marker.emergency_approval_revision
+                )
+                forced_while_active = owner is not None and (
+                    owner.released_revision is None
+                    or owner.released_revision > revision
+                )
+                if forced_while_active:
+                    record["suspended_kind"] = "emergency"
+                    record["suspended_by_emergency_application_id"] = (
+                        forced_marker.emergency_application_id
+                    )
+                    emergency_suspended_ids.append(ev.application_id)
+                else:
+                    record["suspended_kind"] = "ordinary"
+            else:
+                record["suspended_kind"] = "ordinary"
         else:
             effective_ids.append(ev.application_id)
+            if is_emergency:
+                active_emergency_ids.append(ev.application_id)
         approval_records.append(record)
 
     revocation_records = [
@@ -894,6 +1313,109 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         }
         for ev in resumptions
     ]
+
+    # Emergency lifecycle records.  The ordinary suspension/resumption/
+    # approval/revocation events already drive per-license status replay;
+    # these marker rows classify the forced steps and group them by their
+    # owning occupation so every stage reconstructs revision by revision.
+    forced_by_occupation: dict[int, list[EmergencySuspensionEvent]] = {}
+    for marker in emergency_suspensions:
+        forced_by_occupation.setdefault(
+            marker.emergency_approval_revision, []
+        ).append(marker)
+    restored_by_occupation: dict[int, list[EmergencyResumptionEvent]] = {}
+    for marker in emergency_resumptions:
+        restored_by_occupation.setdefault(
+            marker.emergency_approval_revision, []
+        ).append(marker)
+
+    emergency_suspension_records = [
+        {
+            "revision": ev.revision,
+            "application_id": ev.application_id,
+            "emergency_application_id": ev.emergency_application_id,
+            "emergency_approval_revision": ev.emergency_approval_revision,
+            "sequence": ev.sequence,
+            "reason": ev.reason,
+            "created_at": iso(ev.created_at),
+        }
+        for ev in emergency_suspensions
+    ]
+    emergency_resumption_records = [
+        {
+            "revision": ev.revision,
+            "application_id": ev.application_id,
+            "guard_band": guard_band_at(session, ev.revision),
+            "emergency_application_id": ev.emergency_application_id,
+            "emergency_approval_revision": ev.emergency_approval_revision,
+            "sequence": ev.sequence,
+            "reason": ev.reason,
+            "created_at": iso(ev.created_at),
+        }
+        for ev in emergency_resumptions
+    ]
+    occupation_records: list[dict[str, Any]] = []
+    active_occupation_records: list[dict[str, Any]] = []
+    for occ in emergency_occupations:
+        suspended = forced_by_occupation.get(occ.approval_revision, [])
+        restored = restored_by_occupation.get(occ.approval_revision, [])
+        restored_ids = {m.application_id for m in restored}
+        record = {
+            "application_id": occ.application_id,
+            "emergency_application_id": occ.application_id,
+            "reason": occ.reason,
+            "approval_revision": occ.approval_revision,
+            "suspension_start_revision": occ.suspension_start_revision,
+            "forced_suspension_application_ids": sorted(
+                m.application_id for m in suspended
+            ),
+            "forced_suspensions": [
+                {
+                    "revision": marker.revision,
+                    "application_id": marker.application_id,
+                    "sequence": marker.sequence,
+                    "reason": marker.reason,
+                    "restored": marker.application_id in restored_ids,
+                }
+                for marker in sorted(suspended, key=lambda m: m.sequence)
+            ],
+            "restored_application_ids": sorted(restored_ids),
+            "restorations": [
+                {
+                    "revision": marker.revision,
+                    "application_id": marker.application_id,
+                    "sequence": marker.sequence,
+                    "reason": marker.reason,
+                }
+                for marker in sorted(restored, key=lambda m: m.sequence)
+            ],
+            "revocation_revision": occ.revocation_revision,
+            "released_revision": occ.released_revision,
+            "created_at": iso(occ.created_at),
+        }
+        if occ.released_revision is not None and occ.released_revision <= revision:
+            record["status"] = "released"
+        elif occ.approval_revision <= revision:
+            record["status"] = "active"
+            active_occupation_records.append(
+                {
+                    "application_id": occ.application_id,
+                    "emergency_application_id": occ.application_id,
+                    "reason": occ.reason,
+                    "approval_revision": occ.approval_revision,
+                    "suspension_start_revision": occ.suspension_start_revision,
+                    "forced_suspension_application_ids": record[
+                        "forced_suspension_application_ids"
+                    ],
+                    "revocation_revision": None,
+                    "released_revision": None,
+                }
+            )
+        else:
+            # The queried revision is inside this occupation's
+            # forced-suspension sequence (before its approval revision).
+            record["status"] = "activating"
+        occupation_records.append(record)
 
     # Replay restriction-window lifecycle rows: an activation inserts the
     # window (keyed by its stable window id), a release removes it.  The
@@ -951,6 +1473,15 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         ],
         "effective_application_ids": effective_ids,
         "suspended_application_ids": suspended_ids,
+        # Licenses forcibly suspended by an emergency occupation still in
+        # force at the revision (subset of suspended_application_ids).
+        "emergency_suspended_application_ids": emergency_suspended_ids,
+        # Emergency applications holding an in-force occupation at the rev.
+        "active_emergency_application_ids": active_emergency_ids,
+        "active_emergency_occupations": active_occupation_records,
+        "emergency_occupations": occupation_records,
+        "emergency_suspensions": emergency_suspension_records,
+        "emergency_resumptions": emergency_resumption_records,
         "active_restriction_window_ids": sorted(active_windows),
         "active_restriction_windows": active_window_records,
         "restriction_window_events": window_records,
@@ -1007,6 +1538,14 @@ def build_revision_comparison(
     target_suspended = set(target_snapshot["suspended_application_ids"])
     base_windows = set(base_snapshot["active_restriction_window_ids"])
     target_windows = set(target_snapshot["active_restriction_window_ids"])
+    base_emergencies = set(base_snapshot["active_emergency_application_ids"])
+    target_emergencies = set(target_snapshot["active_emergency_application_ids"])
+    base_emergency_suspended = set(
+        base_snapshot["emergency_suspended_application_ids"]
+    )
+    target_emergency_suspended = set(
+        target_snapshot["emergency_suspended_application_ids"]
+    )
 
     def in_scope(app_id: int) -> bool:
         return application_id is None or app_id == application_id
@@ -1098,6 +1637,67 @@ def build_revision_comparison(
         restriction_window_events.append(record)
         events.append(record)
 
+    # Emergency occupation marker events.  The ordinary approval /
+    # suspension / resumption / revocation events of the same revisions are
+    # already in the stream above and drive the per-application status
+    # changes; these typed markers only let audit clients follow the
+    # emergency stages explicitly.
+    emergency_suspension_events: list[dict[str, Any]] = []
+    for event in newer.get("emergency_suspensions", []):
+        if event["revision"] <= older_revision or not in_scope(
+            event["application_id"]
+        ):
+            continue
+        record = dict(event)
+        record["type"] = "emergency_suspension"
+        emergency_suspension_events.append(record)
+        events.append(record)
+
+    emergency_resumption_events: list[dict[str, Any]] = []
+    for event in newer.get("emergency_resumptions", []):
+        if event["revision"] <= older_revision or not in_scope(
+            event["application_id"]
+        ):
+            continue
+        record = dict(event)
+        record["type"] = "emergency_resumption"
+        emergency_resumption_events.append(record)
+        events.append(record)
+
+    emergency_occupation_events: list[dict[str, Any]] = []
+    for occ in newer.get("emergency_occupations", []):
+        approval_rev = occ["approval_revision"]
+        released_rev = occ["released_revision"]
+        if (
+            approval_rev > older_revision
+            and (
+                application_id is None
+                or application_id == occ["application_id"]
+                or application_id
+                in occ.get("forced_suspension_application_ids", [])
+            )
+        ):
+            activated = dict(occ)
+            activated["type"] = "emergency_occupation_activated"
+            activated["revision"] = approval_rev
+            emergency_occupation_events.append(activated)
+            events.append(activated)
+        if (
+            released_rev is not None
+            and older_revision < released_rev <= newer_revision
+            and (
+                application_id is None
+                or application_id == occ["application_id"]
+                or application_id
+                in occ.get("forced_suspension_application_ids", [])
+            )
+        ):
+            released = dict(occ)
+            released["type"] = "emergency_occupation_released"
+            released["revision"] = released_rev
+            emergency_occupation_events.append(released)
+            events.append(released)
+
     events.sort(key=lambda event: event["revision"])
 
     interval_statuses = _snapshot_status_map(older)
@@ -1140,6 +1740,14 @@ def build_revision_comparison(
     base_suspended_removed = sorted(base_suspended - target_suspended)
     base_windows_added = sorted(target_windows - base_windows)
     base_windows_removed = sorted(base_windows - target_windows)
+    base_emergencies_added = sorted(target_emergencies - base_emergencies)
+    base_emergencies_removed = sorted(base_emergencies - target_emergencies)
+    base_emergency_suspended_added = sorted(
+        target_emergency_suspended - base_emergency_suspended
+    )
+    base_emergency_suspended_removed = sorted(
+        base_emergency_suspended - target_emergency_suspended
+    )
 
     def revision_view(
         snapshot: dict[str, Any], statuses: dict[int, str]
@@ -1211,6 +1819,22 @@ def build_revision_comparison(
             "added_to_target": base_windows_added,
             "removed_from_base": base_windows_removed,
         },
+        "active_emergency_application_ids": {
+            "base": sorted(base_emergencies),
+            "target": sorted(target_emergencies),
+            "added": base_emergencies_added,
+            "removed": base_emergencies_removed,
+            "added_to_target": base_emergencies_added,
+            "removed_from_base": base_emergencies_removed,
+        },
+        "emergency_suspended_application_ids": {
+            "base": sorted(base_emergency_suspended),
+            "target": sorted(target_emergency_suspended),
+            "added": base_emergency_suspended_added,
+            "removed": base_emergency_suspended_removed,
+            "added_to_target": base_emergency_suspended_added,
+            "removed_from_base": base_emergency_suspended_removed,
+        },
         "status_changes": status_changes,
         "approvals": approvals,
         "suspensions": suspensions,
@@ -1219,6 +1843,9 @@ def build_revision_comparison(
         "license_transfers": license_transfers,
         "guard_band_changes": guard_band_changes,
         "restriction_window_events": restriction_window_events,
+        "emergency_suspensions": emergency_suspension_events,
+        "emergency_resumptions": emergency_resumption_events,
+        "emergency_occupations": emergency_occupation_events,
         "differences": events,
         "events": events,
     }
@@ -1313,6 +1940,7 @@ def current_revision() -> dict[str, Any]:
             for position, entry in enumerate(load_waitlist(session), start=1)
         ]
         active_window_rows = load_active_windows(session)
+        active_occupation_rows = load_active_occupations(session)
     return {
         "current_revision": revision,
         "guard_band": guard_band,
@@ -1320,6 +1948,19 @@ def current_revision() -> dict[str, Any]:
         "effective_applications": effective_applications,
         "suspended_application_ids": snapshot["suspended_application_ids"],
         "suspended_applications": suspended_applications,
+        # Licenses forcibly paused by an in-force emergency occupation
+        # (subset of suspended_application_ids).
+        "emergency_suspended_application_ids": snapshot[
+            "emergency_suspended_application_ids"
+        ],
+        # Emergency applications holding an in-force occupation.
+        "active_emergency_application_ids": snapshot[
+            "active_emergency_application_ids"
+        ],
+        "active_emergency_occupations": snapshot["active_emergency_occupations"],
+        "emergency_occupations": snapshot["emergency_occupations"],
+        "emergency_suspensions": snapshot["emergency_suspensions"],
+        "emergency_resumptions": snapshot["emergency_resumptions"],
         "active_restriction_window_ids": [row.id for row in active_window_rows],
         "active_restriction_windows": [
             serialize_window_row(row) for row in active_window_rows
@@ -2052,6 +2693,17 @@ def revoke_application(
                         status_code=409,
                         details={"status": row.status},
                     )
+                if emergency_occupation_for(session, application_id) is not None:
+                    # An effective emergency license cannot be revoked
+                    # ordinarily; the dedicated emergency release revokes it
+                    # as its first step.
+                    raise APIError(
+                        E_EMERGENCY_STATE,
+                        f"application {application_id} is an effective "
+                        "emergency license and cannot be ordinarily revoked; "
+                        "release its emergency occupation instead",
+                        status_code=409,
+                    )
 
                 was_suspended = row.status == "suspended"
                 meta.revision += 1
@@ -2150,6 +2802,17 @@ def suspend_application(
                         "approved licenses can be suspended",
                         status_code=409,
                         details={"status": row.status},
+                    )
+                if emergency_occupation_for(session, application_id) is not None:
+                    # An effective emergency license cannot be put on an
+                    # ordinary outage pause; the occupation ends only via its
+                    # dedicated release.
+                    raise APIError(
+                        E_EMERGENCY_STATE,
+                        f"application {application_id} is an effective "
+                        "emergency license and cannot be ordinarily suspended; "
+                        "release its emergency occupation instead",
+                        status_code=409,
                     )
 
                 if payload.expected_revision != current:
@@ -2253,6 +2916,28 @@ def resume_application(
                         "suspended licenses can be resumed",
                         status_code=409,
                         details={"status": row.status},
+                    )
+
+                forced_by = emergency_occupation_for_suspended(
+                    session, application_id
+                )
+                if forced_by is not None:
+                    # A license forcibly suspended by an active occupation
+                    # cannot be restored by an ordinary resume; it is
+                    # re-adjudicated (and possibly restored) when the
+                    # emergency occupation is released.
+                    raise APIError(
+                        E_EMERGENCY_STATE,
+                        f"application {application_id} is forcibly suspended "
+                        f"by the active emergency occupation of application "
+                        f"{forced_by.application_id}; ordinary resume is "
+                        "refused; release that emergency occupation instead",
+                        status_code=409,
+                        details={
+                            "status": row.status,
+                            "emergency_application_id": forced_by.application_id,
+                            "emergency_approval_revision": forced_by.approval_revision,
+                        },
                     )
 
                 if payload.expected_revision != current:
@@ -3220,12 +3905,15 @@ def confirm_license_transfer(
 
                 # Status precedes the revision check (same precedence as the
                 # single/batch approve handlers).
-                if source.status != "approved":
+                if source.status != "approved" or emergency_occupation_for(
+                    session, source.id
+                ) is not None:
                     raise APIError(
                         E_SOURCE_NOT_EFFECTIVE,
-                        f"source application {source.id} is {source.status}; "
-                        "only an approved, non-suspended, non-revoked license "
-                        "can be handed over",
+                        f"source application {source.id} is not an ordinary "
+                        "effective license; an active emergency license can "
+                        "only be handed over by releasing its emergency "
+                        "occupation",
                         status_code=409,
                         details={
                             "application_id": source.id,
@@ -3416,3 +4104,684 @@ def confirm_license_transfer(
                 details={"current_revision": latest},
             )
     return response
+
+
+# --------------------------------------------------------------------------- #
+# Burst-communication emergency occupations
+# --------------------------------------------------------------------------- #
+@app.post("/api/emergency-occupations/preview", tags=["emergency-occupations"])
+def preview_emergency_occupation(
+    payload: EmergencyOccupationRequest,
+) -> dict[str, Any]:
+    """Rehearse an emergency frequency occupation without changing state.
+
+    Returns the current revision (carry it into the confirmation as
+    ``expected_revision``), the effective ordinary licenses the emergency
+    would forcibly suspend (``would_force_suspend``), conflicts with other
+    effective emergency licenses (``emergency_conflicts`` - a hard blocker)
+    and the active restriction windows the application hits.  Status
+    problems are listed under ``blockers`` rather than raised, so the
+    rehearsal always shows the current picture; nothing is mutated and no
+    revision is consumed.
+    """
+    with SessionLocal() as session:
+        return emergency_preview_body(session, payload)
+
+
+@app.post("/api/emergency-occupations", status_code=201, tags=["emergency-occupations"])
+def confirm_emergency_occupation(
+    payload: EmergencyOccupationConfirmRequest,
+) -> dict[str, Any]:
+    """Confirm a rehearsed burst-communication emergency occupation.
+
+    Runs in the shared singleton revision arbitration.  Inside the lock the
+    application must exist and still be pending, the expected revision must
+    be current, the application must hit no active restriction window, and
+    it must not interfere with another effective emergency license.
+    Otherwise the whole occupation is rejected and no revision is consumed;
+    interference with ordinary licenses does *not* reject the occupation -
+    those licenses are forcibly suspended instead.
+
+    On success the conflicting ordinary licenses are first recorded as
+    forced suspensions (application-id order; ordinary suspension event plus
+    emergency marker per license; no waitlist re-adjudication), each on a
+    consecutive revision; a queued emergency application leaves the waitlist
+    before its approval; the emergency approval then consumes the next
+    consecutive revision with an ordinary approval event; and one immutable
+    ``EmergencyOccupationEvent`` links the whole sequence.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as every other writer.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+                guard_band = meta.guard_band
+
+                emergency = session.get(Application, payload.application_id)
+                if emergency is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"application {payload.application_id} does not exist",
+                        status_code=404,
+                    )
+                if emergency.status == "revoked":
+                    raise APIError(
+                        E_ALREADY_REVOKED,
+                        f"application {emergency.id} has been revoked",
+                        status_code=409,
+                    )
+                if emergency.status != "pending":
+                    raise APIError(
+                        E_EMERGENCY_NOT_PENDING,
+                        f"application {emergency.id} is {emergency.status}; "
+                        "only a pending application can be occupied urgently",
+                        status_code=409,
+                        details={
+                            "application_id": emergency.id,
+                            "status": emergency.status,
+                            "approval_revision": emergency.approval_revision,
+                        },
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-preview and "
+                        "re-decide; the emergency occupation was not performed",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                # Re-adjudicate under the lock against the whole current
+                # effective set.  A hit window forbids the occupation; a
+                # conflict with another emergency license cannot be resolved
+                # by suspending it.  Ordinary conflicts are the licenses to
+                # be forcibly suspended below.
+                emergency_ids = active_emergency_application_ids(session)
+                candidate = to_license(emergency)
+                effective = load_effective_licenses(session)
+                conflicts = adjudication.evaluate(
+                    candidate, effective, guard_band
+                )
+                window_rows = load_active_windows(session)
+                window_hits = window_hits_for(candidate, window_rows)
+                if window_hits:
+                    raise APIError(
+                        E_RESTRICTION_WINDOW,
+                        f"emergency application {emergency.id} hits "
+                        f"{len(window_hits)} active restriction window(s); "
+                        "the emergency occupation was not performed",
+                        status_code=409,
+                        details={
+                            "current_revision": current,
+                            "restriction_window_conflicts": [
+                                serialize_window_hit(h) for h in window_hits
+                            ],
+                            "conflicts": [
+                                serialize_conflict(c, guard_band)
+                                for c in conflicts
+                            ],
+                        },
+                    )
+                emergency_conflicts = [
+                    c
+                    for c in conflicts
+                    if c.other.application_id in emergency_ids
+                ]
+                if emergency_conflicts:
+                    raise APIError(
+                        E_EMERGENCY_INTERFERENCE,
+                        f"emergency application {emergency.id} would interfere "
+                        f"with {len(emergency_conflicts)} effective emergency "
+                        "license(s); the emergency occupation was not performed",
+                        status_code=409,
+                        details={
+                            "current_revision": current,
+                            "conflicts": [
+                                serialize_conflict(c, guard_band)
+                                for c in emergency_conflicts
+                            ],
+                        },
+                    )
+
+                forced_rows = [
+                    session.get(Application, c.other.application_id)
+                    for c in sorted(
+                        conflicts, key=lambda c: c.other.application_id
+                    )
+                ]
+                start_revision = current
+
+                # Step 1 (no forced suspensions when the band is free):
+                # each interfering ordinary license is recorded as a forced
+                # suspension on its own consecutive revision.  Unlike an
+                # ordinary outage suspension the standby queue is NOT
+                # re-adjudicated here: the emergency approval comes next and
+                # needs the spectrum.
+                # The forced suspensions occupy current+1 .. current+k and
+                # the emergency approval occupies current+k+1; when no
+                # ordinary license conflicts, the approval is the only new
+                # revision.  The revisions are deterministic under the lock.
+                approval_revision = current + 1 + len(forced_rows)
+                suspension_start_revision = (
+                    current + 1 if forced_rows else approval_revision
+                )
+
+                forced_details: list[dict[str, Any]] = []
+                for sequence, lic_row in enumerate(forced_rows):
+                    meta.revision += 1
+                    suspension_revision = meta.revision
+                    suffix = f": {payload.reason}" if payload.reason else ""
+                    reason = (
+                        f"forcibly suspended for emergency occupation of "
+                        f"application {emergency.id}{suffix}"
+                    )
+                    session.add(
+                        SuspensionEvent(
+                            revision=suspension_revision,
+                            application_id=lic_row.id,
+                            reason=reason,
+                        )
+                    )
+                    session.add(
+                        EmergencySuspensionEvent(
+                            revision=suspension_revision,
+                            application_id=lic_row.id,
+                            emergency_application_id=emergency.id,
+                            emergency_approval_revision=approval_revision,
+                            sequence=sequence,
+                            reason=payload.reason,
+                        )
+                    )
+                    lic_row.status = "suspended"
+                    lic_row.suspended_revision = suspension_revision
+                    forced_details.append(
+                        {
+                            "application_id": lic_row.id,
+                            "revision": suspension_revision,
+                            "sequence": sequence,
+                            "application": serialize_application(lic_row),
+                        }
+                    )
+
+                # A queued emergency application leaves the standby queue
+                # before its (manual) approval, exactly like a handover
+                # successor.
+                entry = (
+                    session.query(WaitlistEntry)
+                    .filter(WaitlistEntry.application_id == emergency.id)
+                    .one_or_none()
+                )
+                emergency_was_waitlisted = entry is not None
+                if entry is not None:
+                    session.delete(entry)
+
+                # Step 2: the ordinary emergency approval on the next
+                # consecutive revision.  It is a normal, manual approval
+                # event; the occupation row below is the emergency marker.
+                meta.revision += 1
+                assert meta.revision == approval_revision
+                session.add(
+                    ApprovalEvent(
+                        revision=approval_revision,
+                        application_id=emergency.id,
+                        guard_band=guard_band,
+                        auto_approved=False,
+                        release_revision=None,
+                    )
+                )
+                emergency.status = "approved"
+                emergency.approval_revision = approval_revision
+
+                # Audit link row grouping the forced suspensions and the
+                # emergency approval of this occupation.
+                session.add(
+                    EmergencyOccupationEvent(
+                        application_id=emergency.id,
+                        approval_revision=approval_revision,
+                        suspension_start_revision=suspension_start_revision,
+                        reason=payload.reason,
+                    )
+                )
+
+                # Post-decision view: the ordinary conflicts are the very
+                # licenses just paused, no window/emergency conflict could
+                # survive the checks above, and the emergency now joins the
+                # active emergency set.
+                session.flush()
+                active_emergency_ids = active_emergency_application_ids(session)
+                response = {
+                    "occupied": True,
+                    "application_id": emergency.id,
+                    "emergency_application_id": emergency.id,
+                    "expected_revision": payload.expected_revision,
+                    "from_revision": start_revision,
+                    "approval_revision": approval_revision,
+                    # Headline revision: the emergency approval revision.
+                    "revision": approval_revision,
+                    "to_revision": meta.revision,
+                    "final_revision": meta.revision,
+                    "guard_band": guard_band,
+                    "reason": payload.reason,
+                    "emergency_was_waitlisted": emergency_was_waitlisted,
+                    "suspension_start_revision": suspension_start_revision,
+                    "forced_suspension_count": len(forced_details),
+                    "forced_suspension_application_ids": [
+                        item["application_id"] for item in forced_details
+                    ],
+                    "forced_suspensions": forced_details,
+                    "emergency_application": serialize_application(emergency),
+                    "ready": True,
+                    "blockers": [],
+                    "active_emergency_application_ids": sorted(
+                        active_emergency_ids
+                    ),
+                    "would_force_suspend_application_ids": [
+                        item["application_id"] for item in forced_details
+                    ],
+                    "would_force_suspend": [],
+                    "emergency_conflicts": [],
+                    "effective_application_ids": [
+                        lic.application_id
+                        for lic in load_effective_licenses(session)
+                    ],
+                    "has_conflicts": False,
+                    "conflicts": [],
+                    "has_restriction_window_conflicts": False,
+                    "restriction_window_conflicts": [],
+                    "active_restriction_window_ids": [
+                        row.id for row in load_active_windows(session)
+                    ],
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer took a revision slot; nothing was changed.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-preview and re-decide; the emergency occupation was not "
+                "performed",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+@app.post(
+    "/api/emergency-occupations/{application_id}/release",
+    tags=["emergency-occupations"],
+)
+def release_emergency_occupation(
+    application_id: int, payload: EmergencyReleaseRequest
+) -> dict[str, Any]:
+    """Lift an active emergency occupation and restore what it can.
+
+    The whole release is one atomic transaction in the shared revision
+    arbitration.  Inside the lock the named emergency application must own
+    an occupation still active and the expected revision must be current;
+    an unknown application (404), a non-emergency application
+    (``emergency_occupation_not_active``) and a stale or repeated release
+    (``stale_revision``) leave the state untouched.
+
+    On success, in order: the emergency license is revoked on the first
+    revision; the licenses still forcibly suspended by *this* occupation are
+    re-adjudicated in their suspension order under the current guard band
+    and active windows - passers are restored on consecutive revisions,
+    blocked licenses stay suspended with the blocking reasons returned;
+    finally the standby queue is drained by the existing FIFO rules.  The
+    occupation row's revocation/final revisions are stamped last.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as every other writer.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+                guard_band = meta.guard_band
+
+                emergency = session.get(Application, application_id)
+                if emergency is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"application {application_id} does not exist",
+                        status_code=404,
+                    )
+                occupation = emergency_occupation_for(session, application_id)
+                if occupation is None:
+                    # Distinguish "never an occupation / already released"
+                    # via the immutable event stream, like window release.
+                    ever = (
+                        session.query(EmergencyOccupationEvent)
+                        .filter(
+                            EmergencyOccupationEvent.application_id
+                            == application_id
+                        )
+                        .one_or_none()
+                    )
+                    if ever is None:
+                        raise APIError(
+                            E_EMERGENCY_NOT_ACTIVE,
+                            f"application {application_id} has no emergency "
+                            "occupation",
+                            status_code=409,
+                        )
+                    raise APIError(
+                        E_EMERGENCY_NOT_ACTIVE,
+                        f"the emergency occupation of application "
+                        f"{application_id} is no longer active (released at "
+                        f"revision {ever.released_revision})",
+                        status_code=409,
+                        details={
+                            "application_id": application_id,
+                            "released_at_revision": ever.released_revision,
+                            "approval_revision": ever.approval_revision,
+                        },
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-decide; the "
+                        "emergency occupation was not released",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                # Licenses still forcibly suspended by this occupation at
+                # release time, in the original suspension order.  A
+                # license already revoked or already restored is skipped.
+                markers = (
+                    session.query(EmergencySuspensionEvent)
+                    .filter(
+                        EmergencySuspensionEvent.emergency_application_id
+                        == emergency.id
+                    )
+                    .order_by(EmergencySuspensionEvent.sequence)
+                    .all()
+                )
+                pending_forced: list[
+                    tuple[EmergencySuspensionEvent, Application]
+                ] = []
+                for marker in markers:
+                    lic_row = session.get(Application, marker.application_id)
+                    if (
+                        lic_row is None
+                        or lic_row.status != "suspended"
+                        or lic_row.suspended_revision != marker.revision
+                    ):
+                        # Revoked in the meantime (revoking a forcibly
+                        # suspended license is allowed) or already restored
+                        # by another path: nothing to re-adjudicate.
+                        continue
+                    pending_forced.append((marker, lic_row))
+
+                # Step 1: revoke the emergency license (ordinary revocation).
+                meta.revision += 1
+                revocation_revision = meta.revision
+                previous_approval_revision = emergency.approval_revision
+                session.add(
+                    RevocationEvent(
+                        revision=revocation_revision,
+                        application_id=emergency.id,
+                        reason=payload.reason,
+                    )
+                )
+                emergency.status = "revoked"
+
+                # Step 2: re-adjudicate the still-forced licenses in their
+                # suspension order under the live band and windows.  Each
+                # passer is restored on the next consecutive revision and
+                # immediately rejoins the effective set, so later licenses
+                # are checked against it; blocked licenses stay suspended.
+                window_rows = load_active_windows(session)
+                effective_now = load_effective_licenses(session)
+                restored_details: list[dict[str, Any]] = []
+                blocked_details: list[dict[str, Any]] = []
+                for marker, lic_row in pending_forced:
+                    candidate = to_license(lic_row)
+                    conflicts = adjudication.evaluate(
+                        candidate, effective_now, guard_band
+                    )
+                    hits = window_hits_for(candidate, window_rows)
+                    if conflicts or hits:
+                        blocked_details.append(
+                            {
+                                "application_id": lic_row.id,
+                                "forced_suspension_revision": marker.revision,
+                                "sequence": marker.sequence,
+                                "conflicts": [
+                                    serialize_conflict(c, guard_band)
+                                    for c in conflicts
+                                ],
+                                "restriction_window_conflicts": [
+                                    serialize_window_hit(h) for h in hits
+                                ],
+                                "reason": (
+                                    "still blocked at emergency release: "
+                                    + (
+                                        "license interference"
+                                        if conflicts
+                                        else "restriction window hit"
+                                    )
+                                ),
+                                "application": serialize_application(lic_row),
+                            }
+                        )
+                        continue
+
+                    meta.revision += 1
+                    resumption_revision = meta.revision
+                    suffix = f": {payload.reason}" if payload.reason else ""
+                    session.add(
+                        ResumptionEvent(
+                            revision=resumption_revision,
+                            application_id=lic_row.id,
+                            guard_band=guard_band,
+                            reason=(
+                                "restored on emergency occupation release of "
+                                f"application {emergency.id}{suffix}"
+                            ),
+                        )
+                    )
+                    session.add(
+                        EmergencyResumptionEvent(
+                            revision=resumption_revision,
+                            application_id=lic_row.id,
+                            emergency_application_id=emergency.id,
+                            emergency_approval_revision=occupation.approval_revision,
+                            sequence=marker.sequence,
+                            reason=payload.reason,
+                        )
+                    )
+                    lic_row.status = "approved"
+                    lic_row.suspended_revision = None
+                    effective_now.append(candidate)
+                    restored_details.append(
+                        {
+                            "application_id": lic_row.id,
+                            "revision": resumption_revision,
+                            "forced_suspension_revision": marker.revision,
+                            "sequence": marker.sequence,
+                            "guard_band": guard_band,
+                            "application": serialize_application(lic_row),
+                        }
+                    )
+
+                # Step 3: the standby queue is re-adjudicated with the
+                # normal FIFO rules; auto approvals keep the emergency
+                # revocation revision as their release revision.
+                waitlist_result = drain_waitlist(
+                    session, meta, revocation_revision
+                )
+
+                # Stamp the occupation as released with the emergency
+                # revocation revision and the final committed revision.
+                occupation.revocation_revision = revocation_revision
+                occupation.released_revision = meta.revision
+
+                session.flush()
+                response = {
+                    "released": True,
+                    "application_id": emergency.id,
+                    "emergency_application_id": emergency.id,
+                    "expected_revision": payload.expected_revision,
+                    "approval_revision": occupation.approval_revision,
+                    "revocation_revision": revocation_revision,
+                    "previous_approval_revision": previous_approval_revision,
+                    "restored_application_ids": [
+                        item["application_id"] for item in restored_details
+                    ],
+                    "restorations": restored_details,
+                    "still_suspended_application_ids": [
+                        item["application_id"] for item in blocked_details
+                    ],
+                    "still_suspended": blocked_details,
+                    "reason": payload.reason,
+                    # Headline final revision after restoration + queue drain.
+                    "revision": meta.revision,
+                    "to_revision": meta.revision,
+                    "final_revision": meta.revision,
+                    "guard_band": guard_band,
+                    **waitlist_result,
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer took a revision slot; nothing was changed.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-decide; the emergency occupation was not released",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+@app.get("/api/emergency-occupations", tags=["emergency-occupations"])
+def list_emergency_occupations(
+    status: str = "active", include_inactive: bool = False
+) -> dict[str, Any]:
+    """List emergency occupations.
+
+    By default only occupations currently in force are returned; pass
+    ``include_inactive=true`` (or ``status=all``) to also include released
+    occupations reconstructed from the immutable event stream.
+    ``status=released`` returns only the released ones.
+    """
+    if status not in ("active", "released", "all"):
+        raise APIError(
+            E_VALIDATION,
+            "status filter must be one of active, released, all",
+            status_code=422,
+        )
+    want_active = include_inactive or status in ("active", "all")
+    want_released = include_inactive or status in ("released", "all")
+    with SessionLocal() as session:
+        meta = session.get(RevisionMeta, 1)
+        rows = (
+            session.query(EmergencyOccupationEvent)
+            .order_by(EmergencyOccupationEvent.approval_revision)
+            .all()
+        )
+        markers_by_occupation: dict[int, list[EmergencySuspensionEvent]] = {}
+        for marker in session.query(EmergencySuspensionEvent).all():
+            markers_by_occupation.setdefault(
+                marker.emergency_approval_revision, []
+            ).append(marker)
+
+        active_bodies: list[dict[str, Any]] = []
+        released_bodies: list[dict[str, Any]] = []
+        for row in rows:
+            suspended = markers_by_occupation.get(row.approval_revision, [])
+            if row.released_revision is None:
+                if want_active:
+                    active_bodies.append(
+                        serialize_occupation(row, forced_suspensions=suspended)
+                    )
+            elif want_released:
+                body = serialize_occupation(row, forced_suspensions=suspended)
+                released_bodies.append(body)
+
+        return {
+            "current_revision": meta.revision,
+            "active_emergency_application_ids": [
+                body["application_id"] for body in active_bodies
+            ],
+            "active_occupations": active_bodies,
+            "released_occupations": released_bodies,
+            "occupations": active_bodies + released_bodies,
+        }
+
+
+@app.get(
+    "/api/emergency-occupations/{application_id}",
+    tags=["emergency-occupations"],
+)
+def get_emergency_occupation(application_id: int) -> dict[str, Any]:
+    """Fetch one emergency occupation (active or previously released)."""
+    with SessionLocal() as session:
+        rows = (
+            session.query(EmergencyOccupationEvent)
+            .filter(EmergencyOccupationEvent.application_id == application_id)
+            .order_by(EmergencyOccupationEvent.approval_revision)
+            .all()
+        )
+        if not rows:
+            raise APIError(
+                E_EMERGENCY_NOT_ACTIVE,
+                f"application {application_id} has no emergency occupation",
+                status_code=404,
+            )
+        # An application hosts at most one occupation in its lifecycle.
+        occupation = rows[0]
+        markers = (
+            session.query(EmergencySuspensionEvent)
+            .filter(
+                EmergencySuspensionEvent.emergency_application_id
+                == application_id
+            )
+            .order_by(EmergencySuspensionEvent.sequence)
+            .all()
+        )
+        resumptions = (
+            session.query(EmergencyResumptionEvent)
+            .filter(
+                EmergencyResumptionEvent.emergency_application_id
+                == application_id
+            )
+            .order_by(EmergencyResumptionEvent.sequence)
+            .all()
+        )
+        body = serialize_occupation(occupation, forced_suspensions=markers)
+        body["restored_application_ids"] = sorted(
+            m.application_id for m in resumptions
+        )
+        body["restorations"] = [
+            {
+                "revision": marker.revision,
+                "application_id": marker.application_id,
+                "sequence": marker.sequence,
+                "reason": marker.reason,
+            }
+            for marker in resumptions
+        ]
+        emergency_row = session.get(Application, application_id)
+        body["application"] = (
+            serialize_application(emergency_row)
+            if emergency_row is not None
+            else None
+        )
+        return {"occupation": body}

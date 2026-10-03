@@ -21,6 +21,21 @@ History is event-sourced:
                            links the ordinary revocation of the source license
                            and the ordinary (manual) approval of its pending
                            successor, which keep two consecutive revisions;
+* ``emergency_occupation_events`` - append-only burst-communication emergency
+                           occupation record, one per occupation, keyed by the
+                           emergency approval revision; ``released_revision``
+                           (and ``revocation_revision``) stay NULL until the
+                           occupation is lifted;
+* ``emergency_suspension_events`` - append-only record marking an ordinary
+                           license as *forcibly* suspended by an emergency
+                           occupation (the ordinary ``suspension_events`` row
+                           on the same revision is still written); never
+                           triggers a waitlist re-adjudication;
+* ``emergency_resumption_events`` - append-only record of a license restored
+                           while an emergency occupation was lifted (the
+                           ordinary ``resumption_events`` row on the same
+                           revision is still written); licenses that stay
+                           suspended have no such row;
 * ``guard_band_events``  - append-only guard-band record, one per revision
                            (revision 0 is the initial value seeded at database
                            creation, every later row is one confirmed online
@@ -200,6 +215,143 @@ class LicenseTransferEvent(Base):
     __table_args__ = (
         Index("ix_license_transfer_events_source", "source_application_id"),
         Index("ix_license_transfer_events_successor", "successor_application_id"),
+    )
+
+
+class EmergencyOccupationEvent(Base):
+    """Append-only record of a burst-communication emergency occupation.
+
+    Operators preview (a read-only rehearsal) and then confirm an emergency
+    occupation for one still-pending application and an operator reason.  On
+    confirmation every currently effective *ordinary* license that interferes
+    with the emergency application (under the live guard band) is first
+    marked forcibly suspended - one ordinary :class:`SuspensionEvent` plus
+    one linked :class:`EmergencySuspensionEvent` per license, consuming
+    consecutive revisions and never draining the waitlist - and the
+    emergency application is then approved on the next consecutive revision
+    with an ordinary :class:`ApprovalEvent`.  This row links that whole
+    sequence and exists purely for audit and historical snapshots; the
+    ordinary events remain the source of truth for per-license status.
+
+    ``approval_revision`` is the emergency approval revision (unique);
+    ``suspension_start_revision`` is the first forced-suspension revision of
+    the sequence (equal to the approval revision when no license was paused).
+    ``revocation_revision`` and ``released_revision`` stay NULL while the
+    occupation is active and are set when the occupation is lifted (the
+    emergency license is revoked first, consuming that revision).
+    """
+
+    __tablename__ = "emergency_occupation_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # The emergency application approved for the occupation.
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The emergency approval revision: the occupation's key revision.
+    approval_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, unique=True
+    )
+    # First revision of the forced-suspension sequence (== approval_revision
+    # when the occupation paused no ordinary licenses).
+    suspension_start_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Set when the occupation is lifted: the emergency license revocation
+    # revision (NULL while active).
+    revocation_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Set when the whole release transaction has committed: its final
+    # revision (restorations + waitlist auto approvals may follow the
+    # revocation).  NULL while active; snapshots use it to decide whether
+    # the occupation is in force.
+    released_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_emergency_occupation_events_application", "application_id"),
+    )
+
+
+class EmergencySuspensionEvent(Base):
+    """Append-only marker for a license forcibly suspended by an emergency.
+
+    One row per forced pause, on the same revision as the ordinary
+    :class:`SuspensionEvent` of the license; that ordinary row keeps all
+    existing suspension semantics (snapshots, status), while this row
+    identifies the pause as an emergency one and links it to the owning
+    :class:`EmergencyOccupationEvent` by the emergency application id and the
+    emergency approval revision.  Forced suspensions are recorded in a
+    deterministic order (application id ascending) and never trigger a
+    waitlist re-adjudication.
+    """
+
+    __tablename__ = "emergency_suspension_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    # The ordinary license that was forcibly paused.
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The owning occupation: the emergency application and its approval rev.
+    emergency_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    emergency_approval_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Order in which the licenses of one occupation were paused (0-based).
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_emergency_suspension_events_application", "application_id"),
+        Index(
+            "ix_emergency_suspension_events_emergency",
+            "emergency_application_id",
+        ),
+    )
+
+
+class EmergencyResumptionEvent(Base):
+    """Append-only marker for a license restored while an emergency is lifted.
+
+    One row per successful restoration, on the same revision as the ordinary
+    :class:`ResumptionEvent` of the license; the ordinary row keeps all
+    existing resumption semantics (including its guard-band snapshot), while
+    this row links the restoration to the owning occupation.  Licenses that
+    are re-adjudicated during a release but stay blocked (and therefore keep
+    their forced suspension) have no row here.
+    """
+
+    __tablename__ = "emergency_resumption_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    # The ordinary license that was restored.
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The owning occupation: the emergency application and its approval rev.
+    emergency_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    emergency_approval_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Same order as the original forced suspensions (application id asc).
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_emergency_resumption_events_application", "application_id"),
+        Index(
+            "ix_emergency_resumption_events_emergency",
+            "emergency_application_id",
+        ),
     )
 
 
