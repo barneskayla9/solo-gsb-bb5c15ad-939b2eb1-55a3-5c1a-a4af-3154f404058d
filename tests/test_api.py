@@ -1105,6 +1105,8 @@ class TestSuspendResume:
                 "revision": 2,
                 "application_id": a,
                 "reason": "device downtime",
+                "forced": False,
+                "forced_by_emergency_application_id": None,
                 "created_at": current["suspensions"][0]["created_at"],
             }
         ]
@@ -1379,6 +1381,8 @@ class TestSuspendResume:
                 "revision": 2,
                 "application_id": a,
                 "reason": "down",
+                "forced": False,
+                "forced_by_emergency_application_id": None,
                 "created_at": snap2["suspensions"][0]["created_at"],
             }
         ]

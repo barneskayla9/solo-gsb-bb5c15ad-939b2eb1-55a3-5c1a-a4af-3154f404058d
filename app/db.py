@@ -94,6 +94,88 @@ def _ensure_approval_event_waitlist_columns() -> None:
                     "ADD COLUMN release_revision INTEGER"
                 )
             )
+        # Burst-communication emergency occupations: marks the ordinary
+        # approval event that grants an emergency license.
+        if "emergency" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE approval_events "
+                    "ADD COLUMN emergency BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+
+
+def _ensure_emergency_columns() -> None:
+    """Add emergency-occupation-era columns to older databases.
+
+    Mirrors :func:`_ensure_guard_band_column`: ``create_all`` only creates
+    missing tables, so every nullable/Boolean column the emergency feature
+    adds to an existing table is added idempotently with a compatible
+    default; historical rows read back as ordinary events / ordinary
+    effective licenses.
+    """
+    inspector = inspect(engine)
+
+    def columns_of(table: str) -> set[str]:
+        return {col["name"] for col in inspector.get_columns(table)}
+
+    with engine.begin() as conn:
+        app_cols = columns_of("applications")
+        if "force_suspended_by" not in app_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE applications "
+                    "ADD COLUMN force_suspended_by INTEGER"
+                )
+            )
+
+        rev_cols = columns_of("revocation_events")
+        if "emergency_release" not in rev_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE revocation_events "
+                    "ADD COLUMN emergency_release BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "emergency_application_id" not in rev_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE revocation_events "
+                    "ADD COLUMN emergency_application_id INTEGER"
+                )
+            )
+
+        susp_cols = columns_of("suspension_events")
+        if "forced" not in susp_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE suspension_events "
+                    "ADD COLUMN forced BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "forced_by_emergency_application_id" not in susp_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE suspension_events "
+                    "ADD COLUMN forced_by_emergency_application_id INTEGER"
+                )
+            )
+
+        res_cols = columns_of("resumption_events")
+        if "forced_recovery" not in res_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE resumption_events "
+                    "ADD COLUMN forced_recovery BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "emergency_application_id" not in res_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE resumption_events "
+                    "ADD COLUMN emergency_application_id INTEGER"
+                )
+            )
 
 
 def init_db() -> None:
@@ -112,6 +194,7 @@ def init_db() -> None:
     _ensure_guard_band_column()
     _ensure_suspended_revision_column()
     _ensure_approval_event_waitlist_columns()
+    _ensure_emergency_columns()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:

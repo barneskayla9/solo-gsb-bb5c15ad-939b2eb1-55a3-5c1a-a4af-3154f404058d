@@ -35,6 +35,18 @@ History is event-sourced:
 * ``restriction_window_events`` - append-only activation/release records for
                            restriction windows, one per revision, so snapshots
                            reconstruct the windows active at any revision;
+* ``emergency_occupations`` - one row per burst-communication emergency
+                           frequency grab: the emergency application, its
+                           approval revision, the spanned force-suspension
+                           revisions and the release revision (NULL while
+                           active).  The forced suspensions are ordinary
+                           ``suspension_events`` rows flagged ``forced``, the
+                           release-time restorations are ordinary
+                           ``resumption_events`` rows flagged
+                           ``forced_recovery``, and the emergency approval /
+                           release revocation are ordinary approval /
+                           revocation events flagged ``emergency`` /
+                           ``emergency_release``;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -103,6 +115,14 @@ class Application(Base):
     # Revision of the latest suspension while status == "suspended"; cleared
     # again on every resumption and left set as a historical marker on revoke.
     suspended_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # While an emergency occupation is active, an ordinary license forced out
+    # of the effective set by that occupation carries the emergency
+    # application's id here; NULL for ordinary suspensions and effective
+    # licenses.  Cleared on the emergency release (the license either resumes
+    # or turns into an ordinary suspension) and on revoke.  Used by the
+    # live-state guards (ordinary resume/suspend refusal); historical as-of
+    # state is replayed from the suspension/resumption events instead.
+    force_suspended_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -132,6 +152,13 @@ class ApprovalEvent(Base):
     release_revision: Mapped[int | None] = mapped_column(
         Integer, nullable=True
     )
+    # True when this approval is the (manual, never auto-approved) approval
+    # of a burst-communication emergency occupation.  The emergency audit row
+    # (EmergencyOccupation) links this revision; the approval event itself is
+    # otherwise an ordinary, immutable approval record.
+    emergency: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -148,6 +175,17 @@ class RevocationEvent(Base):
         ForeignKey("applications.id"), nullable=False
     )
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # True when this revocation is the end of an emergency occupation
+    # (releasing the emergency license during the emergency release).  The
+    # event is otherwise an ordinary, immutable revocation record.
+    emergency_release: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # For an emergency-release revocation: the emergency application id whose
+    # occupation is ending (NULL for ordinary and handover revocations).
+    emergency_application_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -220,6 +258,19 @@ class SuspensionEvent(Base):
         ForeignKey("applications.id"), nullable=False
     )
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # True when this suspension was *forced* by a burst-communication
+    # emergency occupation (the ordinary license had to clear the spectrum),
+    # rather than an equipment outage.  A forced suspension never triggers a
+    # waitlist re-adjudication; while its emergency is active the license can
+    # be revoked but not ordinarily suspended or resumed.
+    forced: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # The emergency application id that forced this suspension (NULL for an
+    # ordinary equipment-outage suspension).
+    forced_by_emergency_application_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -246,6 +297,17 @@ class ResumptionEvent(Base):
     # Snapshot of the guard band in force when the license was resumed.
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # True when this resumption is the automatic restoration during an
+    # emergency-occupation release (the forced suspension is lifted), as
+    # opposed to an operator-driven ordinary resume.
+    forced_recovery: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # For a forced recovery: the emergency application id whose occupation is
+    # being released (NULL for ordinary resumptions).
+    emergency_application_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -399,3 +461,74 @@ class RevisionMeta(Base):
     # GUARD_BAND environment variable; afterwards only changed through the
     # online config endpoint and never overwritten at startup.
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class EmergencyOccupation(Base):
+    """Audit + current-state row for one burst-communication emergency grab.
+
+    An emergency occupation lets an operator take spectrum ahead of normal
+    queued decisions: a read-only rehearsal (the emergency preview) lists the
+    current revision, the ordinary effective licenses the emergency candidate
+    would interfere with (these get *force-suspended* on confirmation), the
+    already-emergency licenses it would interfere with (these reject the
+    whole grab) and the active restriction windows it hits.  The confirmation
+    carries the expected revision and, inside the shared revision
+    arbitration, re-checks that the emergency application is still pending,
+    hits no window and interferes with no other emergency license; otherwise
+    the whole request is rejected without touching the revision.
+
+    On success the interfering ordinary licenses are force-suspended first,
+    one consecutive revision each, in a fixed order (each is an ordinary
+    ``SuspensionEvent`` flagged ``forced`` and **does not** trigger a waitlist
+    re-adjudication); a queued emergency application leaves the waitlist; the
+    emergency license is then approved (an ordinary ``ApprovalEvent`` flagged
+    ``emergency``) at the next consecutive revision.  The original approval
+    records of the force-suspended licenses are never rewritten.
+
+    An emergency license can neither be ordinarily suspended nor ordinarily
+    revoked; the occupation ends only through the dedicated release (which
+    revokes the emergency license, restores the still-suspended licenses one
+    by one after re-adjudication and finally drains the waitlist, all
+    atomically).  A force-suspended license can be revoked ordinarily but an
+    ordinary resume is refused while its emergency is active.  A stale
+    expected revision or a repeated release leaves the state untouched.
+
+    The row is the mutable current-state mirror (``released_revision`` is
+    NULL while active) and the audit link between the revisions; the append-
+    only approval/suspension/resumption/revocation events are the source of
+    truth for historical revision snapshots.
+    """
+
+    __tablename__ = "emergency_occupations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # The emergency application whose approval is the occupation.
+    emergency_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False, unique=True, index=True
+    )
+    # Revision at which the emergency license was approved (the occupation's
+    # last confirmation revision, after the force-suspension revisions).
+    emergency_approval_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, unique=True
+    )
+    # First/last force-suspension revisions bookkeeping; NULL only when the
+    # emergency interfered with no ordinary license (both stay NULL).
+    first_force_suspension_revision: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    last_force_suspension_revision: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # NULL while the occupation is active; set to the emergency license
+    # revocation revision when the dedicated release ends the occupation.
+    released_revision: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, unique=True
+    )
+    release_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    released_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

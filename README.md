@@ -396,6 +396,128 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 - 交接不触碰保护带宽与管制窗口本身；启动时新表由建表流程自动创建，既有库与
   已生效带宽、修订号不受影响，重启状态不变。
 
+### 突发通信紧急占频（预演 → 占用 → 解除）
+
+突发通信需要**优先占频**时，运营人员以待审申请自身的三元形状（覆盖圆、频率
+闭区间、UTC 左闭右开时段）代表要抢占的频谱，给出申请 ID 与原因，先做**只读
+预演**，再携当前修订号确认占用；占用只能由专门的**解除**结束。
+
+**两步操作**
+
+- `POST /api/emergency-occupations/preview`，请求体
+  `{"application_id": 待审申请, "reason": "可选原因"}`：**不改任何状态、不占
+  修订号**。返回 `current_revision`（确认时作为 `expected_revision`）、当前
+  `guard_band`，并把当前有效许可分成两类：
+  - `force_suspend_licenses` / `force_suspend_application_ids`：互扰的**普通
+    许可**——确认时会被逐张**强制暂停**（按许可 ID 固定顺序）；
+  - `emergency_conflicts` / `emergency_conflict_application_ids`：互扰的
+    **其他紧急占用许可**——紧急不能压紧急，存在即整笔不可确认；
+  - 另有 `restriction_window_conflicts[]`（命中的生效管制窗口，保护带宽不
+    扩张窗口）、`waitlist_position`（紧急申请当前是否在候补及 FIFO 位置）、
+    `planned_first_force_suspension_revision` / `planned_approval_revision` /
+    `planned_final_revision`（确认将占用的连续修订号）。
+  - `ready` 与 `blockers[]`：申请不存在（`not_found`）、非待审（`not_pending`）、
+    与紧急许可互扰（`emergency_occupation_conflict`）或命中窗口
+    （`restriction_window`）时 `ready=false` 并逐项列出（预演始终 200，状态
+    问题放在 `blockers` 而非直接报错）。
+- `POST /api/emergency-occupations`，请求体
+  `{"application_id": ..., "expected_revision": n, "reason": "..."}`：与所有
+  既有写操作**共用同一修订号锁**，锁内**重新计算**：申请必须仍**待审**（未知
+  → 404 `not_found`；已撤销 → 409 `already_revoked`；已批准/暂停 → 409
+  `not_pending`）→ 修订号必须为当前值（过期 → 409 `stale_revision`）→ **不
+  命中任何生效管制窗口**（命中 → 409 `restriction_window`）→ **不与任何其他
+  紧急占用许可互扰**（互扰 → 409 `emergency_occupation_conflict`）。任一不
+  满足都**整笔拒绝**：许可、候补队列、修订号**均不变**。
+
+**整笔生效时（一次提交，各步占连续修订号）**
+
+1. 互扰的**普通许可先逐张强制暂停**，按固定顺序（许可 ID 升序）各占一个
+   连续修订号：写的是**普通 `suspension_events`**（`forced=true`、
+   `forced_by_emergency_application_id=紧急申请`），许可状态变 `suspended`、
+   现场标记 `force_suspended_by=紧急申请`，**原批准记录不改**；强制暂停
+   **不触发候补重裁**（不释放给候补）。
+2. 紧急申请若在候补，**先退队**。
+3. 再批准紧急申请，占下一个连续修订号：写**普通 `approval_events`**
+   （`emergency=true`，且 `auto_approved=false`、`release_revision=null`），
+   申请变 `approved`。另写一条 `emergency_occupations` 记录关联强制暂停
+   起止修订与紧急批准修订（审计与当前状态镜像）。
+
+响应给出 `occupied`、`id`、`emergency_approval_revision` / `revision`（紧急
+批准修订）、`first/last_force_suspension_revision`、`to_revision`、
+`force_suspended_application_ids` / `force_suspensions[]`（含逐项修订与许可
+快照）、`was_waitlisted` 与紧急申请最新状态。
+
+**占用期间普通操作的边界**
+
+- 被强制暂停的普通许可**可照常撤销**（普通撤销语义，同事务照旧 FIFO 重裁
+  候补；撤销时清掉 `force_suspended_by`）。
+- 被强制暂停的普通许可**普通恢复一律拒绝**：409 `force_suspended`
+  （`details.force_suspended_by` 给出紧急申请）；对它再次普通暂停同样 409
+  `force_suspended`。
+- 紧急许可**不得普通暂停或普通撤销**：均返回 409
+  `emergency_license_protected`；占用**只能通过解除结束**。
+
+**解除（按暂停顺序重裁，整笔原子提交）**
+
+`POST /api/emergency-occupations/{紧急申请ID}/release`，请求体
+`{"expected_revision": n, "reason": "可选"}`。在同一修订锁内按序：
+
+1. **先撤销紧急许可**，占一个修订号（普通 `revocation_events`，
+   `emergency_release=true`、`emergency_application_id=紧急申请`）；
+2. 再按**原强制暂停顺序**，对**仍因本次占用处于强制暂停**的许可，用**当前
+   保护带宽**、**当前窗口**和“截至此刻的全部有效许可”（含本轮已恢复者）
+   **逐张重裁**：
+   - 无互扰且不命中窗口者**恢复**，各占一个连续修订号（普通
+     `resumption_events`，`forced_recovery=true`、
+     `emergency_application_id=紧急申请`），清掉 `force_suspended_by`；
+   - 受阻者**保持暂停**，清掉紧急标记（占用已结束，它退回为**普通暂停**，
+     之后可正常普通恢复），响应在 `blocked[]` 中返回其互扰对象
+     （`conflicts[]`）与命中窗口（`restriction_window_conflicts[]`）；
+   - 占用期间已被普通撤销的许可不在恢复之列；
+3. 最后按 **FIFO 重裁候补**（沿用现有候补重裁，自动批准占后续连续修订号）。
+
+响应给出 `released`、`emergency_revocation_revision` / `revision`、
+`restored_application_ids` / `restorations[]`（逐项修订、带宽与许可快照）、
+`blocked_application_ids` / `blocked[]`、`final_revision` / `to_revision`，以及
+与暂停/撤销响应同构的候补重裁结果（`auto_approved_application_ids` /
+`auto_approvals` / `remaining_waitlist_application_ids` / `waitlist_pending`）。
+
+**解除的拒绝与幂等**
+
+- 紧急申请从未有过占用 → 404 `emergency_occupation_not_found`；
+- 占用已经解除后再次解除 → 409 `emergency_occupation_not_active`
+  （`details.released_revision` 给出解除修订号）；
+- 修订号过期 → 409 `stale_revision`。
+  三种拒绝（含**过期修订**与**重复解除**）都**不改状态、不占修订号**。
+
+**查询与历史**
+
+- `GET /api/emergency-occupations` 仅列生效中占用（`active_occupations`）；
+  `?include_inactive=true`（或 `?status=released` / `?status=all`）同时列出
+  已解除占用（`released_occupations`；附 `released_revision` /
+  `release_reason` / `released_at`），合并列表 `occupations` 按占用 ID 排序。
+- `GET /api/emergency-occupations/{紧急申请ID}` 查单个占用（生效中或已解除；
+  从未存在 → 404 `emergency_occupation_not_found`）。
+- `GET /api/revision/{n}` 与 `/api/revision/current` 追加
+  `active_emergency_application_ids`（当前持有紧急许可的申请，有效集合的
+  子集）、`force_suspended_application_ids`（被生效占用强制暂停的许可，暂停
+  集合的子集）、`emergency_occupations`（含各占用强制暂停/已恢复清单与
+  `status`/`released_revision`）与 `emergency_occupation_events`
+  （`activated` 于紧急批准修订、`released` 于紧急撤销修订）；每条
+  批准/暂停/恢复/撤销记录追加相应的 `emergency` / `forced` /
+  `forced_by_emergency_application_id` / `forced_recovery` /
+  `emergency_application_id` / `emergency_release` 标志（普通许可操作既有字段
+  全部保持，纯增量）；`/api/revision/compare` 追加
+  `active_emergency_application_ids` 与 `force_suspended_application_ids` 的
+  端点集合增删，以及区间内的 `emergency_occupation_activated` /
+  `emergency_occupation_released` 事件（并入统一的 `differences` / `events`，
+  按修订号排序）。强制暂停、恢复、紧急批准与紧急撤销都是**普通事件流**中的
+  行，故每个修订号（含“已强制暂停、紧急尚未批准”与“紧急已撤销、许可尚未
+  恢复”的中间修订）都能精确还原；**原批准事件不追改**。
+- 占用不触碰保护带宽与管制窗口本身；启动时新表由建表流程自动创建，新增列由
+  幂等迁移补齐（历史事件默认按普通事件读取），既有库、已生效带宽与修订号
+  不受影响，重启状态不变。
+
 ### 可用调频位置查询（不改状态）
 
 `POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
@@ -420,11 +542,16 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 ### 修订号与并发模型
 
 - 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、暂停、恢复、撤销、
-  **保护带宽变更**、**管制窗口的启用与解除（各一次）**或**释放时自动获批的每个
+  **保护带宽变更**、**管制窗口的启用与解除（各一次）**、**紧急占用的每张强制
+  暂停与紧急批准（各一次）**、**解除紧急占用的紧急撤销与每张强制恢复（各一次）**
+  或**释放时自动获批的每个
   候补申请**都使修订号 +1，并追加一条不可变事件（暂停/恢复因修订号过期或恢复
-  互扰被拒绝时**不占**修订号；候补登记与取消也**不占**修订号；窗口预演同样
+  互扰被拒绝时**不占**修订号；紧急占用确认因状态/窗口/紧急互扰、解除因修订过期
+  或重复解除而拒绝时也**不占**修订号；候补登记与取消也**不占**修订号；预演同样
   不占修订号）。候补自动批准与其触发释放同处一个事务：释放操作占一个修订号，
-  每个自动获批申请占其后连续的一个修订号。
+  每个自动获批申请占其后连续的一个修订号。紧急占用确认同样一次事务：每张强制
+  暂停与紧急批准依次各占一个连续修订号（强制暂停**不**重裁候补）；解除也是一次
+  事务：紧急撤销、每张成功恢复与每个候补自动批准依次各占一个连续修订号。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
   单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/带宽变更事务：
@@ -520,6 +647,11 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | `GET` | `/api/restriction-windows/{id}` | 查询单个窗口（生效中或已解除） |
 | `POST` | `/api/license-transfers/preview` | **换机许可交接预演**（只读：当前修订号、排除原许可后的干扰、命中窗口；不改状态） |
 | `POST` | `/api/license-transfers` | **确认换机交接**（原许可 + 接替申请 + 预期修订号；撤销与批准占两个连续修订号，再 FIFO 重裁候补） |
+| `POST` | `/api/emergency-occupations/preview` | **紧急占频预演**（只读：当前修订号、将强制暂停的普通许可、互扰的紧急许可、命中窗口；不改状态） |
+| `POST` | `/api/emergency-occupations` | **确认紧急占用**（待审申请 + 预期修订号；先强制暂停普通许可各占一修订号，再批准紧急申请） |
+| `POST` | `/api/emergency-occupations/{id}/release` | **解除紧急占用**（紧急申请 ID + 预期修订号；撤销紧急许可→按暂停顺序重裁恢复→FIFO 重裁候补，整笔原子） |
+| `GET` | `/api/emergency-occupations` | 列出生效紧急占用（`include_inactive`/`status` 可含已解除） |
+| `GET` | `/api/emergency-occupations/{id}` | 查询单个紧急占用（生效中或已解除） |
 | `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 生效窗口 + 全部事件 |
 | `GET` | `/api/revision/compare` | 比较两个已存在修订号的带宽、许可集合、状态与按事件顺序的差异（只读） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
@@ -554,6 +686,11 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | 422 | `same_application` | 换机交接时原许可与接替申请**是同一个申请**（统一校验信封，明细附 `application_id`） |
 | 409 | `source_not_effective` | 换机交接的原许可**不是当前有效许可**（处于待审/暂停/已撤销；`details.status` 给出当前状态；许可、队列、修订号均不变） |
 | 409 | `successor_not_pending` | 换机交接的接替申请**已不是待审**（已批准/暂停；已撤销用 `already_revoked`；`details.status`/`approval_revision` 给出当前状态；不改许可、队列与修订号） |
+| 409 | `emergency_occupation_conflict` | 紧急占频申请与**另一张生效紧急许可**互扰（紧急不能压紧急；`details.conflicts[]` 附冲突对象；整笔不占用，许可、队列、修订号均不变） |
+| 409 | `emergency_license_protected` | 对**生效紧急许可**普通暂停或普通撤销（紧急占用只能由专门解除结束；`details.status` 给出当前状态；不改状态、不占修订号） |
+| 409 | `force_suspended` | 对**被生效紧急占用强制暂停的普通许可**执行普通暂停或普通恢复（`details.force_suspended_by` 给出紧急申请；不改状态、不占修订号；此类许可可普通撤销） |
+| 404 | `emergency_occupation_not_found` | 解除或查询一个**从未有过紧急占用**的紧急申请 ID |
+| 409 | `emergency_occupation_not_active` | **重复解除**一个已经解除的紧急占用（`details.released_revision` 给出解除修订号；不改状态、不占修订号） |
 
 ---
 

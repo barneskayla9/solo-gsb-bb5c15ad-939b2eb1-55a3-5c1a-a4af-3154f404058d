@@ -172,3 +172,49 @@ class LicenseTransferConfirmRequest(LicenseTransferRequest):
     """
 
     expected_revision: int = Field(ge=0)
+
+
+class EmergencyOccupationRequest(BaseModel):
+    """Rehearse a burst-communication emergency frequency occupation.
+
+    Names the still-pending emergency application (whose own circle, band and
+    time window describe the spectrum being grabbed) and an operator reason.
+    The read-only preview lists the current revision, the ordinary effective
+    licenses that would be force-suspended, any already-emergency licenses
+    that would clash, and the active restriction windows the emergency
+    application hits.  Nothing is mutated and no revision is consumed.
+    """
+
+    application_id: int = Field(ge=1)
+    reason: str = Field(default="", max_length=2000)
+
+
+class EmergencyOccupationConfirmRequest(EmergencyOccupationRequest):
+    """Commit a rehearsed emergency occupation under revision arbitration.
+
+    On success the interfering ordinary licenses are force-suspended (one
+    consecutive revision each, without a waitlist drain), a queued emergency
+    application leaves the queue, and the emergency license is approved at
+    the next consecutive revision.  A stale revision, a status change, a
+    restriction-window hit or a clash with another emergency license rejects
+    the whole occupation without touching licenses, the queue or the
+    revision.
+    """
+
+    expected_revision: int = Field(ge=0)
+
+
+class EmergencyOccupationReleaseRequest(BaseModel):
+    """End an emergency occupation by its emergency application id.
+
+    Carries the expected revision and an optional reason.  The emergency
+    license is revoked first, the licenses still force-suspended by this
+    occupation are re-adjudicated in their suspension order against the
+    current guard band and active windows and restored one revision each
+    (blocked ones stay suspended with the reason returned), and the standby
+    queue is finally re-adjudicated FIFO; the whole sequence commits
+    atomically.  A stale revision or a repeated release changes nothing.
+    """
+
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)

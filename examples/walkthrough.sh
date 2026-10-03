@@ -347,3 +347,61 @@ print("still waiting:", d["remaining_waitlist_application_ids"])'
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective:", d["effective_application_ids"], "; waitlist:", d["waitlist_application_ids"], "; transfers:", [(t["revision"],t["source_application_id"],t["successor_application_id"],t["successor_approval_revision"]) for t in d["license_transfers"]])'
 SRC_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([t["revision"] for t in d["license_transfers"]][0])')
 curl -s "$BASE/api/revision/$SRC_REV" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("at revocation revision", d["revision"], "effective (source gone, successor not yet approved):", d["effective_application_ids"])'
+
+echo "== 45. burst emergency occupation: rehearsal preview (read-only) =="
+mke() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":10},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2027-06-01T08:00:00Z\",\"end\":\"2027-06-01T12:00:00Z\"}
+}"; }
+P=$(mke "ordinary P" 700 710); P_ID=$(echo "$P" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Q=$(mke "ordinary Q" 800 810); Q_ID=$(echo "$Q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$P_ID/approve" "{\"expected_revision\":$EM_REV}" >/dev/null
+EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$Q_ID/approve" "{\"expected_revision\":$EM_REV}" >/dev/null
+# Emergency band [710,800] touches both ordinary bands [700,710] and [800,810].
+E=$(mke "burst emergency" 710 800); E_ID=$(echo "$E" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post /api/emergency-occupations/preview "{\"application_id\":$E_ID,\"reason\":\"burst traffic\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("ready:", d["ready"], "; current:", d["current_revision"], "; force-suspend:", d["force_suspend_application_ids"], "; emergency clashes:", d["emergency_conflict_application_ids"], "; planned approval rev:", d["planned_approval_revision"])'
+EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+
+echo "== 46. confirm: P and Q force-suspended (one rev each, no waitlist drain), emergency approved next =="
+post /api/emergency-occupations "{\"application_id\":$E_ID,\"expected_revision\":$EM_REV,\"reason\":\"burst traffic\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("occupied:", d["occupied"], "; force suspensions:", [(s["revision"],s["application_id"]) for s in d["force_suspensions"]], "; emergency approval rev:", d["emergency_approval_revision"])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective:", d["effective_application_ids"], "; suspended:", d["suspended_application_ids"], "; force-suspended:", d["force_suspended_application_ids"], "; active emergencies:", d["active_emergency_application_ids"])'
+
+echo "== 47. ordinary ops are guarded while the emergency is active =="
+post "/api/applications/$E_ID/suspend" '{"expected_revision":999}' | python3 -c 'import json,sys; print("suspend emergency ->", json.load(sys.stdin)["error"]["code"])'
+post "/api/applications/$E_ID/revoke" '{}' | python3 -c 'import json,sys; print("revoke emergency ->", json.load(sys.stdin)["error"]["code"])'
+post "/api/applications/$P_ID/resume" '{"expected_revision":999}' \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("resume force-suspended P ->", e["code"], "; force_suspended_by:", e["details"]["force_suspended_by"])'
+echo "    (P can still be revoked as an ordinary force-suspended license:)"
+post "/api/applications/$P_ID/revoke" '{"reason":"scrapped anyway"}' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revoked P at revision", d["revision"])'
+
+echo "== 48. a second emergency clashing with the active one is refused (emergency never suspends emergency) =="
+E2=$(mke "second burst" 750 760); E2_ID=$(echo "$E2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+EM_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post /api/emergency-occupations/preview "{\"application_id\":$E2_ID}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("ready:", d["ready"], "; blocker codes:", [b["code"] for b in d["blockers"]])'
+post /api/emergency-occupations "{\"application_id\":$E2_ID,\"expected_revision\":$EM_REV}" \
+  | python3 -c 'import json,sys; print("confirm ->", json.load(sys.stdin)["error"]["code"])'
+
+echo "== 49. release: revoke emergency, restore Q (P was revoked), then FIFO re-adjudicate =="
+post "/api/emergency-occupations/$E_ID/release" "{\"expected_revision\":$EM_REV,\"reason\":\"burst over\"}" \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("emergency revocation rev:", d["emergency_revocation_revision"], "; restored:", [(r["revision"],r["application_id"]) for r in d["restorations"]], "; blocked:", d["blocked_application_ids"], "; final:", d["final_revision"])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective:", d["effective_application_ids"], "; active emergencies:", d["active_emergency_application_ids"], "; force-suspended:", d["force_suspended_application_ids"])'
+
+echo "== 50. repeated / unknown release changes nothing; history restores every phase =="
+FINAL=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/emergency-occupations/$E_ID/release" "{\"expected_revision\":$FINAL}" \
+  | python3 -c 'import json,sys; print("repeat release ->", json.load(sys.stdin)["error"]["code"])'
+post "/api/emergency-occupations/999999/release" "{\"expected_revision\":$FINAL}" \
+  | python3 -c 'import json,sys; print("unknown release ->", json.load(sys.stdin)["error"]["code"])'
+curl -s "$BASE/api/emergency-occupations?include_inactive=true" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("occupations:", [(o["id"],o["application_id"],o["status"],o.get("released_revision")) for o in d["occupations"]])'
+
